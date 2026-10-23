@@ -19,17 +19,35 @@ Install Godot 4.7.2, then run `./run.sh` from this folder, or open
 `project.godot` in Godot and press F6. On the first editor launch, let Godot
 import the project before playing.
 
+A third-person camera follows behind the hero. Click the game to capture the mouse; moving it turns
+the camera and the hero together, and movement keys are relative to the way the hero faces.
+
 | Input | Action |
 | --- | --- |
-| WASD or arrows | Move |
-| Mouse | Aim |
+| Mouse | Look and turn |
+| W / S | Move forward / back |
+| A / D | Step left / right |
 | Left click or J | Strike |
 | Space | Dash |
 | E | Use nearby shrine |
 | Esc | Pause |
 | 1, 2, 3 | Choose a blessing |
 
+Characters are animated in code: at spawn, each model's parts are grouped under pivots at the hips,
+shoulders and neck, then posed every frame for walking, idling and attacking. Enemies wind up before a
+hit lands, so attacks can be dodged.
+
 Rooms are generated from a seed with open doorways in every direction. Generation continues as far as the player travels. Enemies scale with depth; each new room is populated once per run. Leveling gives a choice among three blessings. Death starts a new seed.
+
+## Inspecting animation and recording video
+
+These scripts need a display (use `xvfb-run -a` on a headless machine) and Godot's movie writer:
+
+```sh
+godot4 --path . --rendering-driver opengl3 --write-movie poses.avi --fixed-fps 10 -s tests/pose_sheet.gd      # every rig through walk and attack
+SHOWREEL_SECONDS=20 godot4 --path . --rendering-driver opengl3 --resolution 1280x720 --write-movie run.avi --fixed-fps 30 -s tests/showreel.gd
+godot4 --path . --rendering-driver opengl3 --resolution 1280x720 --write-movie side.avi --fixed-fps 30 -s tests/inspect_view.gd   # same run, filmed from the front
+```
 
 ## Optional local agent bridge
 

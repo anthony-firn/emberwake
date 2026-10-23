@@ -79,6 +79,32 @@ var agent_waiting := false
 var agent_timer := 0.0
 var agent_move := Vector3.ZERO
 var agent_aim := Vector3.ZERO
+# Third-person camera: the mouse turns the camera and the hero together.
+const MOUSE_SENSITIVITY := 0.0032
+const PITCH_MIN := 0.16
+const PITCH_MAX := 1.05
+const CAMERA_HEIGHT := 3.0
+const CAMERA_DISTANCE := 14.0
+var cam_yaw := 0.0
+var cam_pitch := 0.5
+var cam_target := Vector3.ZERO
+var cam_current_distance := CAMERA_DISTANCE
+var mouse_was_captured := false
+var move_world := Vector3.ZERO
+# Procedural animation: model parts are grouped under pivots at their joints when a model is spawned.
+var hero_rig := {}
+var hero_stride := 0.0
+var hero_walk := 0.0
+var hero_attack := -1.0
+var hero_local_move := Vector2.ZERO
+const RIGS := {
+	"knight": {"body":[Vector3(0,.72,0),""], "leg_l":[Vector3(-.2,.7,.15),""], "leg_r":[Vector3(.2,.7,.15),""],
+		"cloak":[Vector3(0,1.62,-.1),"body"], "head":[Vector3(0,1.68,0),"body"], "arm_l":[Vector3(-.42,1.6,.03),"body"], "arm_r":[Vector3(.42,1.6,.03),"body"]},
+	"shade": {"body":[Vector3(0,1.4,0),""], "head":[Vector3(0,1.38,.04),"body"],
+		"arm_l":[Vector3(-.48,1.36,.04),"body"], "arm_r":[Vector3(.48,1.36,.04),"body"]},
+	"guardian": {"body":[Vector3(0,.7,0),""], "leg_l":[Vector3(-.3,.7,0),""], "leg_r":[Vector3(.3,.7,0),""],
+		"head":[Vector3(0,1.66,0),"body"], "arm_l":[Vector3(-.72,1.45,.04),"body"], "arm_r":[Vector3(.72,1.45,.04),"body"]},
+}
 
 func _ready() -> void:
 	get_window().title = "EMBERWAKE — The Endless Descent"
@@ -124,9 +150,9 @@ func _create_scene() -> void:
 	actors.name = "Actors"
 	add_child(actors)
 	camera = Camera3D.new()
-	camera.name = "IsometricCamera"
+	camera.name = "ChaseCamera"
 	camera.current = true
-	camera.fov = 47.0
+	camera.fov = 62.0
 	camera.position = Vector3(13, 18, 16)
 	add_child(camera)
 	camera.look_at(Vector3.ZERO, Vector3.UP)
@@ -189,6 +215,9 @@ func _start_run() -> void:
 	actors.add_child(hero)
 	hero.scale = Vector3.ONE * 2.0
 	hero.position = Vector3.ZERO
+	hero_rig = _rig(hero,"knight")
+	hero_attack = -1.0
+	hero_stride = 0.0
 	sword_light = OmniLight3D.new()
 	sword_light.light_color = Color("ff9e5f")
 	sword_light.light_energy = 1.1
@@ -196,8 +225,12 @@ func _start_run() -> void:
 	sword_light.shadow_enabled = false
 	hero.add_child(sword_light)
 	sword_light.position.y = 1.2
-	camera.position = player.pos + Vector3(13,18,16)
-	camera.look_at(player.pos + Vector3(0,1,0))
+	cam_yaw = 0.0
+	cam_pitch = 0.5
+	cam_target = player.pos + Vector3(0,CAMERA_HEIGHT,0)
+	cam_current_distance = CAMERA_DISTANCE
+	_update_camera(1.0)
+	_capture_mouse(true)
 	menu_ui.hide()
 	overlay_ui.hide()
 	hud_ui.show()
@@ -397,16 +430,22 @@ func _spawn_room(room: Dictionary) -> void:
 		actors.add_child(enemy_model)
 		enemy_model.scale = Vector3.ONE * (1.9 if guardian else 1.75)
 		enemy_model.position = position
+		var enemy_rig := _rig(enemy_model,"guardian" if guardian else "shade")
 		var max_hp: float = (88.0 if guardian else 49.0) * (1.0 + room.depth*.085)
 		enemies.append({"node":enemy_model,"pos":position,"room":room.coord,"hp":max_hp,"max_hp":max_hp,
 			"speed":3.2 if guardian else 4.5,"damage":20.0 if guardian else 12.0,"guardian":guardian,
-			"attack_cd":local_rng.randf(),"stun":0.0,"flash":0.0,"phase":local_rng.randf()*TAU,"alive":true})
+			"attack_cd":local_rng.randf(),"stun":0.0,"flash":0.0,"phase":local_rng.randf()*TAU,"alive":true,
+			"rig":enemy_rig,"walk":local_rng.randf()*TAU,"stride":0.0,"attack_t":-1.0,"hit_done":true})
 	if room.shrine: _toast("A FORGOTTEN SHRINE")
 
 func _process(delta: float) -> void:
 	_poll_agent(delta)
 	if mode != "playing": return
 	if agent_enabled and agent_waiting: return
+	if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED: mouse_was_captured = true
+	elif mouse_was_captured and not agent_enabled:
+		_show_pause()
+		return
 	var dt: float = minf(delta,.04)
 	seconds += dt
 	_update_player(dt)
@@ -424,24 +463,40 @@ func _update_player(dt: float) -> void:
 	player.attack_cd = maxf(0.0,player.attack_cd-dt)
 	player.dash_cd = maxf(0.0,player.dash_cd-dt)
 	player.invulnerable = maxf(0.0,player.invulnerable-dt)
-	var input := agent_move if agent_enabled else Vector3.ZERO
-	if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP): input.z -= 1
-	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN): input.z += 1
-	if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT): input.x -= 1
-	if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): input.x += 1
+	# Keys are relative to the hero, who faces where the camera looks; the agent bridge moves in world directions.
+	var keys := Vector2.ZERO
+	if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP): keys.y += 1
+	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN): keys.y -= 1
+	if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT): keys.x -= 1
+	if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT): keys.x += 1
+	var forward := _camera_forward()
+	var right := Vector3(-forward.z,0,forward.x)
+	var input: Vector3 = agent_move if agent_enabled else Vector3.ZERO
+	input += forward*keys.y + right*keys.x
 	input = input.normalized()
+	move_world = input
+	_update_aim(input)
+	var before: Vector3 = player.pos
 	if player.dash_time > 0:
 		player.dash_time -= dt
 		player.pos = _move_actor(player.pos,player.dash_dir*29.0*dt)
 		if rng.randf() < .55: _spark(player.pos+Vector3(0,.6,0),Color("ffb371"),.45)
 	else:
 		player.pos = _move_actor(player.pos,input*player.speed*dt)
-	_update_aim(input)
-	if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or Input.is_key_pressed(KEY_J): _strike()
+	if Input.is_key_pressed(KEY_J) or (Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED): _strike()
+	var moved: Vector3 = player.pos-before
+	hero_walk += moved.length()*1.55
+	hero_stride = lerpf(hero_stride,clampf(moved.length()/maxf(player.speed*dt,.001),0.0,1.0),minf(1.0,dt*10.0))
+	if moved.length() > .001:
+		var local := Vector2(moved.dot(Vector3(player.facing.z,0,-player.facing.x)),moved.dot(player.facing)).normalized()
+		hero_local_move = hero_local_move.lerp(local,minf(1.0,dt*12.0))
+	if hero_attack >= 0.0:
+		hero_attack += dt/.34
+		if hero_attack > 1.0: hero_attack = -1.0
 	hero.position = player.pos
-	hero.rotation.y = atan2(player.facing.x,player.facing.z) + PI
-	hero.position.y = sin(seconds*9.0)*.045 if input.length() > 0 else 0.0
-	sword_light.light_energy = 1.05 + sin(seconds*7.0)*.16
+	hero.rotation.y = atan2(player.facing.x,player.facing.z)
+	_pose(hero_rig,hero_stride,hero_walk,hero_attack,seconds,hero_local_move,.32 if player.dash_time > 0 else 0.0)
+	sword_light.light_energy = 1.05 + sin(seconds*7.0)*.16 + (.9 if hero_attack >= 0.0 else 0.0)
 	var room_coord := _coord_for(player.pos)
 	if room_coord != current_room:
 		current_room = room_coord
@@ -459,26 +514,144 @@ func _update_aim(input: Vector3) -> void:
 		if agent_aim.length() > .01: player.facing = agent_aim.normalized()
 		elif input.length() > 0: player.facing = input.normalized()
 		return
-	var pointer := get_viewport().get_mouse_position()
-	var from := camera.project_ray_origin(pointer)
-	var direction := camera.project_ray_normal(pointer)
-	if absf(direction.y) > .001:
-		var t: float = -from.y/direction.y
-		if t > 0:
-			target_position = from + direction*t
-			var aim: Vector3 = target_position-player.pos
-			aim.y = 0
-			if aim.length() > .6:
-				player.facing = aim.normalized()
-				return
-	if input.length() > 0: player.facing = input
+	player.facing = _camera_forward()
+
+func _rig_part(kind: String, base: String, side: float) -> String:
+	match kind:
+		"knight":
+			if base in ["Boot","Boot cap"]: return "leg_r" if side > 0 else "leg_l"
+			if base == "Arm": return "arm_r" if side > 0 else "arm_l"
+			if base.begins_with("Sword"): return "arm_r"
+			if base in ["Head","Deep hood","Visor shadow","Glowing eye"]: return "head"
+			if base in ["Layered cloak","Inner cloak"]: return "cloak"
+		"shade":
+			if base in ["Claw sleeve","Claw"]: return "arm_r" if side > 0 else "arm_l"
+			if base in ["Hollow skull","Dark cowl","Face abyss","Eye"]: return "head"
+		"guardian":
+			if base == "Leg": return "leg_r" if side > 0 else "leg_l"
+			if base == "Heavy arm": return "arm_r" if side > 0 else "arm_l"
+			if base in ["Helmet","Visor","Horn","Glowing slit"]: return "head"
+	return "body"
+
+## Groups a model's separate parts under pivot nodes at its joints, so limbs can swing.
+func _rig(model: Node3D, kind: String) -> Dictionary:
+	var spec: Dictionary = RIGS[kind]
+	var pivots := {}
+	var rest := {}
+	for key in spec:
+		var at: Vector3 = spec[key][0]
+		var parent_key: String = spec[key][1]
+		var pivot := Node3D.new()
+		pivot.name = key
+		if parent_key == "":
+			model.add_child(pivot)
+			pivot.position = at
+		else:
+			pivots[parent_key].add_child(pivot)
+			pivot.position = at - (spec[parent_key][0] as Vector3)
+		pivots[key] = pivot
+		rest[key] = pivot.position
+	for child in model.get_children():
+		if not child is MeshInstance3D: continue
+		var key := _rig_part(kind,String(child.name).get_slice("_",0),child.position.x)
+		var at: Vector3 = spec[key][0]
+		child.reparent(pivots[key],false)
+		child.position -= at
+	return {"kind":kind,"pivots":pivots,"rest":rest}
+
+func _ease(a: float, b: float, t: float) -> float:
+	return lerpf(a,b,smoothstep(0.0,1.0,clampf(t,0.0,1.0)))
+
+## Poses a rigged model. stride 0..1 blends idle into walking; attack is swing progress 0..1, or negative when idle.
+## local_move is the walk direction relative to the model (x = sideways, y = forward), for strafing legs.
+func _pose(rig: Dictionary, stride: float, walk: float, attack: float, t: float, local_move: Vector2 = Vector2(0,1), lean: float = 0.0) -> void:
+	var p: Dictionary = rig.pivots
+	var rest: Dictionary = rig.rest
+	var s := sin(walk)
+	var breathe := sin(t*2.3)*(1.0-stride)
+	match rig.kind:
+		"knight":
+			var fwd := local_move.y
+			var side := local_move.x
+			for leg in ["leg_l","leg_r"]:
+				var sign := 1.0 if leg == "leg_l" else -1.0
+				p[leg].rotation = Vector3(s*.78*stride*fwd*sign,0,s*.32*stride*side*sign)
+			p.body.position = rest.body + Vector3(0,absf(s)*.13*stride + breathe*.018,0)
+			# The cloak streams back with speed and flutters with each step.
+			p.cloak.rotation = Vector3(.3*stride*maxf(fwd,0.0) + absf(s)*.08*stride + lean*.8, 0, -s*.05*stride)
+			var twist := 0.0
+			var arm := Vector3(-s*.42*stride*fwd,0,.1)
+			if attack >= 0.0:
+				# Wind up over the shoulder, sweep across the front, then recover.
+				var x := _ease(0.0,-2.55,attack/.3) if attack < .3 else (_ease(-2.55,-.45,(attack-.3)/.32) if attack < .62 else _ease(-.45,0.0,(attack-.62)/.38))
+				var y := _ease(0.0,.55,attack/.3) if attack < .3 else (_ease(.55,-.75,(attack-.3)/.32) if attack < .62 else _ease(-.75,0.0,(attack-.62)/.38))
+				arm = Vector3(x,y,.18)
+				twist = y*.45
+			p.arm_r.rotation = arm
+			p.arm_l.rotation = Vector3(s*.55*stride*fwd,0,-.1 - breathe*.04)
+			p.body.rotation = Vector3(.12*stride*fwd + lean, twist + s*.07*stride, s*.07*stride)
+			p.head.rotation = Vector3(-.08*stride*fwd - lean*.5 + breathe*.02, -twist*.4, 0)
+		"shade":
+			var lunge := 0.0
+			var claws := .25 + sin(t*3.1+walk)*.12
+			if attack >= 0.0:
+				claws = _ease(.25,.9,attack/.35) if attack < .35 else (_ease(.9,-1.9,(attack-.35)/.25) if attack < .6 else _ease(-1.9,.25,(attack-.6)/.4))
+				lunge = .35*sin(clampf(attack,0.0,1.0)*PI)
+			p.body.rotation = Vector3(.22*stride + lunge, 0, sin(t*1.7+walk)*.07)
+			p.body.position = rest.body + Vector3(0,sin(t*2.4+walk)*.06,0)
+			p.arm_l.rotation = Vector3(-claws,0,-.12 - sin(t*2.0)*.05)
+			p.arm_r.rotation = Vector3(-claws,0,.12 + sin(t*2.0)*.05)
+			p.head.rotation = Vector3(-lunge*.6, sin(t*.9+walk)*.12, 0)
+		"guardian":
+			for leg in ["leg_l","leg_r"]:
+				var sign := 1.0 if leg == "leg_l" else -1.0
+				p[leg].rotation.x = s*.5*stride*sign
+			var slam := 0.0
+			var arm := s*.35*stride
+			if attack >= 0.0:
+				slam = _ease(0.0,-2.85,attack/.45) if attack < .45 else (_ease(-2.85,-.35,(attack-.45)/.15) if attack < .6 else _ease(-.35,0.0,(attack-.6)/.4))
+			p.body.position = rest.body + Vector3(0,absf(s)*.1*stride + breathe*.02,0)
+			p.body.rotation = Vector3(.08*stride + (.25 if attack >= .45 and attack < .8 else 0.0), s*.06*stride, 0)
+			p.arm_l.rotation = Vector3(slam + arm,0,-.06)
+			p.arm_r.rotation = Vector3(slam - arm,0,.06)
+			p.head.rotation = Vector3(breathe*.03, 0, 0)
+
+## A brief glowing arc in front of the hero that shows the sword's reach.
+func _slash_arc(dir: Vector3) -> void:
+	var mesh := ArrayMesh.new()
+	var center := atan2(dir.x,dir.z)
+	var steps := 14
+	var strip := PackedVector3Array()
+	for i in steps+1:
+		var a: float = center + lerpf(player.arc,-player.arc,float(i)/steps)
+		strip.append(Vector3(sin(a),0,cos(a))*1.4)
+		strip.append(Vector3(sin(a),0,cos(a))*(player.range+.6))
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = strip
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLE_STRIP,arrays)
+	var material := StandardMaterial3D.new()
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	material.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	material.cull_mode = BaseMaterial3D.CULL_DISABLED
+	material.albedo_color = Color(1.0,.62,.3,.55)
+	var arc := MeshInstance3D.new()
+	arc.mesh = mesh
+	arc.material_override = material
+	arc.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	arc.position = player.pos + Vector3(0,1.55,0)
+	actors.add_child(arc)
+	effects.append({"node":arc,"time":.16,"max":.16,"kind":"arc"})
 
 func _strike() -> void:
 	if player.attack_cd > 0 or mode != "playing": return
 	player.attack_cd = player.attack_delay
 	_tone(270,.10,.5,-170)
 	attack_flash = .18
+	hero_attack = 0.0
 	var dir: Vector3 = player.facing
+	_slash_arc(dir)
 	var slash_pos: Vector3 = player.pos + dir*2.25 + Vector3(0,.85,0)
 	var flash := OmniLight3D.new()
 	flash.light_color = Color("ffd5a1")
@@ -503,12 +676,8 @@ func _strike() -> void:
 
 func _dash() -> void:
 	if mode != "playing" or player.dash_cd > 0: return
-	var direction := Vector3.ZERO
-	if Input.is_key_pressed(KEY_W): direction.z -= 1
-	if Input.is_key_pressed(KEY_S): direction.z += 1
-	if Input.is_key_pressed(KEY_A): direction.x -= 1
-	if Input.is_key_pressed(KEY_D): direction.x += 1
-	if direction == Vector3.ZERO: direction = player.facing
+	var direction := move_world
+	if direction.length() < .1: direction = player.facing
 	player.dash_dir = direction.normalized()
 	player.dash_time = .20
 	player.dash_cd = player.dash_delay
@@ -525,14 +694,28 @@ func _update_enemies(dt: float) -> void:
 		e.phase += dt*2.0
 		var to_player: Vector3 = player.pos-e.pos
 		var distance: float = to_player.length()
-		if distance < 20.0 and e.stun <= 0:
+		var before: Vector3 = e.pos
+		var swing_time: float = .75 if e.guardian else .5
+		if e.attack_t >= 0.0:
+			# Attacks wind up first, so the hit lands mid-swing and can be dodged.
+			e.attack_t += dt/swing_time
+			if not e.hit_done and e.attack_t >= (.5 if e.guardian else .45):
+				e.hit_done = true
+				if distance < (2.3 if e.guardian else 1.9): _hurt(e.damage)
+			if e.attack_t >= 1.0: e.attack_t = -1.0
+		elif distance < 20.0 and e.stun <= 0:
 			if distance > 1.3:
 				e.pos = _move_actor(e.pos,to_player.normalized()*e.speed*dt,.75)
 			elif e.attack_cd <= 0:
-				_hurt(e.damage)
+				e.attack_t = 0.0
+				e.hit_done = false
 				e.attack_cd = 1.5 if e.guardian else 1.1
+		var step: float = (e.pos-before).length()
+		e.walk += step*(1.1 if e.guardian else 1.6)
+		e.stride = lerpf(e.stride,clampf(step/maxf(e.speed*dt,.001),0.0,1.0),minf(1.0,dt*8.0))
 		e.node.position = e.pos + Vector3(0,sin(e.phase)*.035,0)
-		if distance > .1: e.node.rotation.y = atan2(to_player.x,to_player.z)+PI
+		if distance > .1: e.node.rotation.y = atan2(to_player.x,to_player.z)
+		_pose(e.rig,e.stride,e.walk,e.attack_t,seconds+e.phase)
 		var base_scale: float = 1.9 if e.guardian else 1.75
 		if e.flash > 0: e.node.scale = Vector3.ONE * base_scale * (1.0+e.flash*.55)
 		else: e.node.scale = Vector3.ONE * base_scale
@@ -615,13 +798,40 @@ func _update_effects(dt: float) -> void:
 			effect.node.position += effect.velocity*dt
 			effect.velocity.y -= dt*12
 			effect.node.scale = Vector3.ONE * effect.time/effect.max
+		elif effect.kind == "arc":
+			var m: StandardMaterial3D = effect.node.material_override
+			m.albedo_color.a = .55*effect.time/effect.max
+			effect.node.scale = Vector3.ONE*(1.0+.12*(1.0-effect.time/effect.max))
 		else: effect.node.light_energy = 3.7*effect.time/effect.max
 	screen_flash.color.a = maxf(0.0,screen_flash.color.a-dt*.95)
 
+func _camera_forward() -> Vector3:
+	return Vector3(-sin(cam_yaw),0,-cos(cam_yaw))
+
 func _update_camera(dt: float) -> void:
-	var desired: Vector3 = player.pos+Vector3(13,18,16)
-	camera.position = camera.position.lerp(desired,minf(1.0,dt*6.0))
-	camera.look_at(player.pos+Vector3(0,1,0))
+	if agent_enabled:
+		# Without a mouse, the camera eases around behind wherever the hero faces.
+		cam_yaw = lerp_angle(cam_yaw,atan2(-player.facing.x,-player.facing.z),minf(1.0,dt*2.2))
+	cam_target = cam_target.lerp(player.pos+Vector3(0,CAMERA_HEIGHT,0),minf(1.0,dt*12.0))
+	var dir := Vector3(sin(cam_yaw)*cos(cam_pitch),sin(cam_pitch),cos(cam_yaw)*cos(cam_pitch))
+	# Pull the camera in front of any wall that would block the view of the hero.
+	var distance := CAMERA_DISTANCE
+	var d := 1.4
+	while d < CAMERA_DISTANCE:
+		var point: Vector3 = cam_target+dir*d
+		if point.y < 3.9 and _solid(Vector3(point.x,0,point.z),.35):
+			distance = maxf(2.4,d-.7)
+			break
+		d += .3
+	var rate: float = 16.0 if distance < cam_current_distance else 3.5
+	cam_current_distance = lerpf(cam_current_distance,distance,minf(1.0,dt*rate))
+	camera.position = cam_target+dir*cam_current_distance
+	camera.look_at(cam_target+Vector3(0,.35,0))
+
+func _capture_mouse(on: bool) -> void:
+	if agent_enabled or DisplayServer.get_name() == "headless": return
+	mouse_was_captured = false
+	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED if on else Input.MOUSE_MODE_VISIBLE
 
 func _use_shrine() -> void:
 	if mode != "playing": return
@@ -643,7 +853,12 @@ func _input(event: InputEvent) -> void:
 			elif mode == "paused": _resume()
 		elif mode == "upgrade" and event.keycode >= KEY_1 and event.keycode <= KEY_3:
 			_choose_blessing(event.keycode-KEY_1)
-	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT and mode == "playing": _strike()
+	if event is InputEventMouseMotion and mode == "playing" and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		cam_yaw -= event.relative.x*MOUSE_SENSITIVITY
+		cam_pitch = clampf(cam_pitch+event.relative.y*MOUSE_SENSITIVITY,PITCH_MIN,PITCH_MAX)
+	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT and mode == "playing":
+		if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED and not agent_enabled: _capture_mouse(true)
+		else: _strike()
 
 func _create_ui() -> void:
 	ui = CanvasLayer.new()
@@ -697,7 +912,7 @@ func _create_ui() -> void:
 	bottom.alignment = BoxContainer.ALIGNMENT_CENTER
 	bottom.add_theme_constant_override("separation",25)
 	hud_ui.add_child(bottom)
-	for text in ["WASD  MOVE","MOUSE  AIM + STRIKE","SPACE  DASH","E  SHRINE","ESC  PAUSE"]:
+	for text in ["WASD  MOVE","MOUSE  LOOK","CLICK  STRIKE","SPACE  DASH","E  SHRINE","ESC  PAUSE"]:
 		bottom.add_child(_label(text,11,Color("c9b59d"),BODY_FONT))
 	dash_label = _label("DASH READY",10,Color("f0bd80"),BODY_FONT)
 	bottom.add_child(dash_label)
@@ -802,6 +1017,7 @@ func _button(text: String, action: Callable) -> Button:
 	return button
 
 func _show_menu() -> void:
+	_capture_mouse(false)
 	hud_ui.hide()
 	menu_ui.show()
 	for child in menu_ui.get_children(): child.queue_free()
@@ -814,10 +1030,11 @@ func _show_menu() -> void:
 	start.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	box.add_child(start)
 	box.add_child(_centered(_label("Forge your path through an infinite, shifting crypt.",14,Color("b4aaa2"),BODY_FONT)))
-	box.add_child(_centered(_label("WASD · MOVE     MOUSE · STRIKE     SPACE · DASH",11,Color("bba385"),BODY_FONT)))
+	box.add_child(_centered(_label("WASD · MOVE     MOUSE · LOOK     CLICK · STRIKE     SPACE · DASH",11,Color("bba385"),BODY_FONT)))
 
 func _open_blessings() -> void:
 	mode = "upgrade"
+	_capture_mouse(false)
 	for child in overlay_ui.get_children(): child.queue_free()
 	var box := _overlay_panel(overlay_ui,810,480)
 	box.add_child(_centered(_label("THE FLAME GROWS BRIGHTER",12,Color("d7a16b"),BODY_FONT)))
@@ -871,11 +1088,13 @@ func _choose_blessing(index: int) -> void:
 		"dash": player.dash_delay *= .8
 	mode = "playing"
 	overlay_ui.hide()
+	_capture_mouse(true)
 	_tone(700,.2,.22,280)
 	_toast(choice.name)
 
 func _show_pause() -> void:
 	mode = "paused"
+	_capture_mouse(false)
 	for child in overlay_ui.get_children(): child.queue_free()
 	var box := _overlay_panel(overlay_ui,460,315)
 	box.add_child(_centered(_label("A MOMENT IN THE DARK",11,Color("c6a17d"),BODY_FONT)))
@@ -889,8 +1108,10 @@ func _show_pause() -> void:
 func _resume() -> void:
 	mode = "playing"
 	overlay_ui.hide()
+	_capture_mouse(true)
 
 func _show_death() -> void:
+	_capture_mouse(false)
 	for child in overlay_ui.get_children(): child.queue_free()
 	var box := _overlay_panel(overlay_ui,510,365)
 	box.add_child(_centered(_label("THE EMBER GOES QUIET",11,Color("c59b7c"),BODY_FONT)))
@@ -918,7 +1139,8 @@ func _update_hud() -> void:
 	depth_label.text = "DEPTH %d" % room.depth
 	kill_label.text = "%d VANQUISHED" % kills
 	dash_label.text = "DASH READY" if player.dash_cd <= 0 else "DASH %.1fs" % player.dash_cd
-	tip_label.text = "[ E ]   RESTORE AT SHRINE" if room.shrine and not room.shrine_used and player.pos.distance_to(Vector3(current_room.x*ROOM_SIZE,0,current_room.y*ROOM_SIZE)) < 4 else ""
+	if Input.mouse_mode != Input.MOUSE_MODE_CAPTURED and not agent_enabled and DisplayServer.get_name() != "headless": tip_label.text = "CLICK TO TAKE CONTROL OF THE CAMERA"
+	else: tip_label.text = "[ E ]   RESTORE AT SHRINE" if room.shrine and not room.shrine_used and player.pos.distance_to(Vector3(current_room.x*ROOM_SIZE,0,current_room.y*ROOM_SIZE)) < 4 else ""
 	mini_map.queue_redraw()
 
 func _draw_minimap() -> void:
@@ -932,6 +1154,7 @@ func _draw_minimap() -> void:
 			var pos := Vector2(77+dx*21,77+dz*21)
 			mini_map.draw_rect(Rect2(pos-Vector2(8,8),Vector2(16,16)),PALETTES[room.biome].trim.darkened(.12))
 			if room.shrine and not room.shrine_used: mini_map.draw_circle(pos,2,Color("f4d397"))
+	mini_map.draw_line(Vector2(77,77),Vector2(77,77)+Vector2(player.facing.x,player.facing.z)*11,Color("ffe0a2"),2)
 	mini_map.draw_circle(Vector2(77,77),4,Color("ffe0a2"))
 
 ## Stable observation/action interface for a local Open-Jev decision harness.
