@@ -21,7 +21,7 @@ const PALETTES := [
 	{"name":"THE SUNKEN KEEP", "floor":Color("26353e"), "wall":Color("526d79"), "trim":Color("85a8ac"), "light":Color("82d6e8")},
 ]
 const BLESSINGS := [
-	{"name":"SEARING EDGE", "icon":"✦", "desc":"Deal 25% more sword damage.", "stat":"damage"},
+	{"name":"SEARING EDGE", "icon":"❖", "desc":"Deal 25% more sword damage.", "stat":"damage"},
 	{"name":"SWIFTSTEP", "icon":"➶", "desc":"Move 15% faster.", "stat":"speed"},
 	{"name":"IRON HEART", "icon":"♥", "desc":"Gain 30 maximum health and heal.", "stat":"health"},
 	{"name":"WIDE ARC", "icon":"◈", "desc":"Strike farther and wider.", "stat":"range"},
@@ -82,6 +82,8 @@ var agent_aim := Vector3.ZERO
 
 func _ready() -> void:
 	get_window().title = "EMBERWAKE — The Endless Descent"
+	# Browsers have no system fonts to fall back on, so title text borrows symbols from the body font.
+	TITLE_FONT.set_fallbacks([BODY_FONT])
 	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
 	_create_scene()
 	_create_audio()
@@ -655,7 +657,7 @@ func _create_ui() -> void:
 	left.custom_minimum_size = Vector2(253,0)
 	left.add_theme_constant_override("separation",7)
 	hud_ui.add_child(left)
-	left.add_child(_label("✦  EMBERWAKE",24,Color("f4d9b3"),TITLE_FONT))
+	left.add_child(_label("❖  EMBERWAKE",24,Color("f4d9b3"),TITLE_FONT))
 	left.add_child(_label("THE ENDLESS DESCENT",10,Color("ad8f77"),BODY_FONT))
 	left.add_spacer(false)
 	health_label = _label("VITALITY",11,Color("d0b9a8"),BODY_FONT)
@@ -723,6 +725,8 @@ func _create_ui() -> void:
 	overlay_ui = Control.new()
 	overlay_ui.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	ui.add_child(overlay_ui)
+	# Hidden until a blessing or pause panel opens; while visible it takes clicks meant for the menu below it.
+	overlay_ui.hide()
 
 func _label(value: String, size: int, color: Color, font: Font) -> Label:
 	var label := Label.new()
@@ -803,7 +807,7 @@ func _show_menu() -> void:
 	for child in menu_ui.get_children(): child.queue_free()
 	var box := _overlay_panel(menu_ui,650,530)
 	box.add_child(_centered(_label("AN ENDLESS DESCENT",12,Color("c99d71"),BODY_FONT)))
-	box.add_child(_centered(_label("✦",75,Color("f0aa64"),TITLE_FONT)))
+	box.add_child(_centered(_label("❖",75,Color("f0aa64"),TITLE_FONT)))
 	box.add_child(_centered(_label("EMBERWAKE",66,Color("f3dbb9"),TITLE_FONT)))
 	box.add_child(_centered(_label("The light fades. The labyrinth does not.",16,Color("bfb1a5"),TITLE_FONT)))
 	var start := _button("BEGIN THE DESCENT   ↗",_start_run)
